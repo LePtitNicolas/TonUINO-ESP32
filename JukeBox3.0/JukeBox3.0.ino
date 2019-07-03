@@ -1,20 +1,20 @@
 //==================================================================
-// TonUINO V3.2.0 of ESP32 Basis
+// TonUINO V3.2.1 of ESP32 Basis
 // Original V2.0: T. Voss, Erweitert V3.0: C. Ulbrich
 //------------------------------------------------------------------
 // the DIY jukebox (not only) for kids
 //
 // Take an Arduino, an MP3 module, an RFID reader, a micro SD card,
-// some cables and stuff and an old (or new) bookshelf speaker... 
+// some cables and stuff and an old (or new) bookshelf speaker...
 // and you have the TonUINO!
 //==================================================================
 
 // Used libraries
 #include <WiFi.h>
-#include <WebServer.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-#include "TonUINO_html.h"
+//#include "TonUINO_html.h"         // German version of html page
+#include "TonUINO_fr_local_html.h"        // French version of html page
 #include "TonUINO.h"
 #include <Arduino.h>
 #include "DFRobotDFPlayerMini.h"
@@ -24,17 +24,20 @@
 #include <JC_Button.h>
 #include <math.h>
 #include <FastLED.h>
-#include <Preferences.h>
 #include <Update.h>
+#include <WebServer.h>
+#include <Preferences.h>
 
 // EEPROM Storage *NVS*
+// EEPROM_SIZE = EEPROM.length(); KO for ESP32
+#define EEPROM_SIZE 4096
 Preferences preferences;
 int timeout = 20;
 
 //========================================================================
 // Only variables for testing
 int l = 0;
-bool headphoneIn = 0 ;
+bool headphoneIn = 1; //0;
 int success = 0;
 int success2 = 0;
 
@@ -42,18 +45,20 @@ bool debug = true; //false // Set to "true" to get debug information via the ser
 
 //Variables for saving settings
 //========================================================================
-
 unsigned long last_color = 0xFFFFFF;
 unsigned int last_Volume;
 unsigned int last_max_Volume;
 
 //========================================================================
 //WS2812b settings
-#define DATA_PIN 2      // signal pin 
-#define NUM_LEDS 7      // number of LEDs in your strip
-#define BRIGHTNESS 32   // brightness  (max 254) 
-#define LED_TYPE WS2811 // I know we are using ws2812, but it's ok!
-#define COLOR_ORDER GRB
+#define DATA_PIN 2        // signal pin 
+#define NUM_LEDS 24       // number of LEDs in your strip
+#define BRIGHTNESS 32     // brightness  (max 254) 
+#define LED_TYPE WS2812B  // I know we are using ws2812, but it's ok!
+#define COLOR_ORDER GRB   // Datasheet WS2812 : "Follow the order of GRB to sent data"
+#define OK_COLOR CRGB::Green
+#define KO_COLOR CRGB::Red
+#define WARNING_COLOR CRGB::Orange
 CRGB leds[NUM_LEDS];
 
 //============Sunrise Variables===========================================
@@ -63,7 +68,7 @@ DEFINE_GRADIENT_PALETTE( sunrise_gp ) {
   224,   240, 240,  0,          // yellow
   255,   128, 128, 240
 }; //very bright blue
-static uint16_t heatIndex = 0;  // start out at 0
+static uint16_t heatIndex = 0; // start out at 0
 
 //========================================================================
 //NTP Variables
@@ -79,18 +84,50 @@ int TMR_OFF_REP = 0;
 int TMR_ON_REP = 0;
 unsigned int max_Volume = 40;
 unsigned int akt_Volume = 10;
-bool TMP_OFFTIME = true;
-bool TMP_ONTIME = true;
+unsigned int init_Volume = 12; //Set volume value (0~30).
+unsigned int max_Volume_headphone = 40;
+
+bool TMP_OFFTIME = false;
+bool TMP_ONTIME = false;
 bool WakeUpLight = false;
 bool SleepLight = false;
-bool startSR = false;
+bool startSR = false;        // Bool to start Sunrise simulation
+
+
+//========================================================================
+// Added code line to PCD_Init() (MFRC522.cpp) :
+//  PCD_WriteRegister(RFCfgReg, (0x07<<4)); // Set Rx Gain to max
+// Before :
+//  PCD_AntennaOn();
+//========================================================================
 
 //Set Pins for RC522 Module
-const int resetPin = 22; // Reset pin
-const int ssPin = 21;    // Slave select pin
+#define RESET_PIN 22     // Reset pin 
+#define SS_PIN 21        // Slave select pin 
 
 //Created object for communication with the module
-MFRC522 mfrc522 = MFRC522(ssPin, resetPin); // Create instance
+MFRC522 mfrc522 = MFRC522(SS_PIN, RESET_PIN); // Create instance
+
+//Set Pins for Buttons
+#define buttonPause 25
+#define buttonUp 26
+#define buttonDown 27
+
+//Set Pins for Dfplayer Mini Module
+#define busyPin 4
+#define headphonePin 32
+#define dfpMute 33
+#define RX_PIN 16
+#define TX_PIN 17
+
+#define LONG_PRESS 1000
+
+Button pauseButton(buttonPause);
+Button upButton(buttonUp, 100);
+Button downButton(buttonDown, 100);
+bool ignorePauseButton = false;
+bool ignoreUpButton = false;
+bool ignoreDownButton = false;
 
 //=======================Functions Declaration==============================
 nfcTagObject myCard;
@@ -98,6 +135,15 @@ bool knownCard = false;
 uint16_t numTracksInFolder;
 uint16_t track;
 uint64_t chipid;
+
+MFRC522::MIFARE_Key key;
+bool successRead;
+byte sector = 1;
+byte blockAddr = 4;
+byte trailerBlock = 7;
+MFRC522::StatusCode status;
+
+uint8_t numberOfCards = 0;
 
 //====================Timer Declaration=====================================
 hw_timer_t * timer = NULL;
@@ -128,6 +174,7 @@ class Mp3Notify {
       Serial.println();
       Serial.print("Com Error ");
       Serial.println(errorCode);
+      switchOnLeds(NUM_LEDS, KO_COLOR );
     }
     static void OnPlayFinished(uint16_t track) {
       Serial.print("Track finished");
@@ -143,6 +190,7 @@ class Mp3Notify {
     }
     static void OnCardRemoved(uint16_t code) {
       Serial.println(F("SD card removed "));
+      switchOnLeds(NUM_LEDS, KO_COLOR );
     }
 };
 
@@ -162,7 +210,7 @@ static void nextTrack() {
   if (myCard.mode == 2) {
     if (track != numTracksInFolder) {
       track = track + 1;
-      myDFPlayer.playFolder(myCard.folder, track);
+      playFolder(myCard.folder, track);
       Serial.print(F("Album mode is active -> next track: "));
       Serial.print(track);
     } else
@@ -172,7 +220,7 @@ static void nextTrack() {
     track = random(1, numTracksInFolder + 1);
     Serial.print(F("Party mode is active -> play random track: "));
     Serial.println(track);
-    myDFPlayer.playFolder(myCard.folder, track);
+    playFolder(myCard.folder, track);
   }
   if (myCard.mode == 4) {
     Serial.println(F("Single mode active -> save power"));
@@ -183,7 +231,7 @@ static void nextTrack() {
       track = track + 1;
       Serial.print(F("Audiobook mode is active -> next track and save progress"));
       Serial.println(track);
-      myDFPlayer.playFolder(myCard.folder, track);
+      playFolder(myCard.folder, track);
       // Save progress in the EEPROM
       EEPROM.write(myCard.folder, track);
     } else
@@ -197,58 +245,33 @@ static void nextTrack() {
 static void previousTrack() {
   if (myCard.mode == 1) {
     Serial.println(F("Radio play mode is active -> play track from the beginning"));
-    myDFPlayer.playFolder(myCard.folder, track);
+    playFolder(myCard.folder, track);
   }
   if (myCard.mode == 2) {
     Serial.println(F("Album mode is active -> Previous track"));
     if (track != 1) {
       track = track - 1;
     }
-    myDFPlayer.playFolder(myCard.folder, track);
+    playFolder(myCard.folder, track);
   }
   if (myCard.mode == 3) {
     Serial.println(F("Party Modus is active -> Play track from the beginning"));
-    myDFPlayer.playFolder(myCard.folder, track);
+    playFolder(myCard.folder, track);
   }
   if (myCard.mode == 4) {
     Serial.println(F("Single mode active -> Play track from the beginning"));
-    myDFPlayer.playFolder(myCard.folder, track);
+    playFolder(myCard.folder, track);
   }
   if (myCard.mode == 5) {
     Serial.println(F("Audiobook mode is active -> Next track and save progress"));
     if (track != 1) {
       track = track - 1;
     }
-    myDFPlayer.playFolder(myCard.folder, track);
+    playFolder(myCard.folder, track);
     // Save progress in the EEPROM
     EEPROM.write(myCard.folder, track);
   }
 }
-
-MFRC522::MIFARE_Key key;
-bool successRead;
-byte sector = 1;
-byte blockAddr = 4;
-byte trailerBlock = 7;
-MFRC522::StatusCode status;
-
-#define buttonPause 25
-#define buttonUp 26
-#define buttonDown 27
-#define busyPin 4
-#define headphonePin 32
-#define dfpMute 33
-
-#define LONG_PRESS 1000
-
-Button pauseButton(buttonPause);
-Button upButton(buttonUp, 100);
-Button downButton(buttonDown, 100);
-bool ignorePauseButton = false;
-bool ignoreUpButton = false;
-bool ignoreDownButton = false;
-
-uint8_t numberOfCards = 0;
 
 bool isPlaying() {
   return !digitalRead(busyPin);
@@ -361,8 +384,7 @@ void handleRoot() {
         char charBuf[Color.length() + 1];
         Color.toCharArray(charBuf, Color.length() + 1);
         unsigned long col = strtol(charBuf, &ptr, 16);
-        fill_solid(leds, NUM_LEDS, col); // Change color of all LEDs
-        FastLED.show();
+        switchOnLeds(NUM_LEDS, col );
       }
       else if (server.argName(i) == "LED_bri") {
         Serial.println("The brightness of the LEDs is changed ");
@@ -473,6 +495,18 @@ void handleEQ_JAZZ() {
   server.send(200, "text/html", getPage());
 }
 
+void handleResetCard() {
+  Serial.println("handleResetCard");
+  resetCard();
+  server.send(200, "text/html", getPage());
+}
+
+void handleResetEEPROM() {
+  Serial.println("handleResetEEPROM");
+  ResetEEPROM();
+  server.send(200, "text/html", getPage());
+}
+
 //==========================================================================================
 // Function for the Sunrise simulation
 void sunrise() {
@@ -504,7 +538,7 @@ void TimeCompare() {
     // Sleep Timer
     myDFPlayer.pause();
     delay(100);
-    myDFPlayer.playMp3Folder(902); //Play goodbye
+    playMp3Folder(902); //Play goodbye
     //myDFPlayer.outputDevice(DFPLAYER_DEVICE_SLEEP);
     delay(10000);
     while (isPlaying())
@@ -516,7 +550,7 @@ void TimeCompare() {
   }
 
   else if ((TMR_ON_MM == NTP_MM) and (TMP_ONTIME == false) and (TMR_ON_HH == NTP_HH)) {
-    myDFPlayer.playMp3Folder(903); // Play welcome
+    playMp3Folder(903); // Play welcome
     //myDFPlayer.outputDevice(DFPLAYER_DEVICE_SD);
     if (TMR_ON_REP == 0) {
       TMP_ONTIME = true;
@@ -581,6 +615,7 @@ int WiFi_RouterNetworkDisconnect()
     success = 1;
   }
   Serial.println("Disconnected.");
+  switchOnLeds(NUM_LEDS, WARNING_COLOR );
   return success;
 }
 
@@ -593,13 +628,12 @@ int WiFi_AccessPointStart(char* AccessPointNetworkSSID)
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   WiFi.softAP("TonUINO");  // Name  des Access Points
   delay(500);
-  if (debug)  Serial.println("Starte AP");
+  if (debug)  Serial.println("Start AP");
   if (debug)  Serial.print("IP Adresse ");      //Output of current IP server
   if (debug)  Serial.println(WiFi.softAPIP());
 
   //Announcement that an access point is opened
-  myDFPlayer.playMp3Folder(901);
-
+  playMp3Folder(901);
   server.on("/", handleSetup);                // INI wifimanager Index Webseite send
   server.on("/restart", []() {                 // INI wifimanager Index Webseite send
     server.send(200, "text/plain", "ESP reset is done");
@@ -640,19 +674,19 @@ void setup() {
   //WS2812b Configure
   //===================================================================================
   // tell FastLED about the LED strip configuration
-  FastLED.addLeds<WS2812B, DATA_PIN, RGB>(leds, NUM_LEDS);
+  FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);  // Adjust the brightness
-  fill_solid(leds, NUM_LEDS, CRGB::Black); // Change color of all LEDs
-  FastLED.show();
+  switchOnLeds(1, OK_COLOR );
 
   //===================================================================================
 
   Serial.begin(115200);
   SPI.begin();
-  mySoftwareSerial.begin(9600, SERIAL_8N1, 16, 17);  // speed, type, RX, TX
+  mySoftwareSerial.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);  // speed, type, RX, TX
   randomSeed(analogRead(33)); // Initialize the random number generator
   mfrc522.PCD_Init();
   mfrc522.PCD_DumpVersionToSerial();
+  switchOnLeds(2, OK_COLOR );
 
   pinMode(dfpMute, OUTPUT);
   digitalWrite(dfpMute, LOW);
@@ -665,6 +699,7 @@ void setup() {
 
   // Busy Pin
   pinMode(busyPin, INPUT);
+  switchOnLeds(3, OK_COLOR );
 
   for (byte i = 0; i < 6; i++) {
     key.keyByte[i] = 0xFF;
@@ -674,13 +709,12 @@ void setup() {
   // PAUSE/UP/DOWN
   if (digitalRead(buttonPause) == LOW && digitalRead(buttonUp) == LOW &&
       digitalRead(buttonDown) == LOW) {
-    Serial.println(F("Reset -> EEPROM is deleted"));
-    for (int i = 0; i < EEPROM.length(); i++) {
-      EEPROM.write(i, 0);
-    }
-  }
+    ResetEEPROM();
 
-  Serial.println("TonUINO V3.2.0 of ESP32 Basis");
+  }
+  switchOnLeds(4, OK_COLOR );
+
+  Serial.println("TonUINO V3.2.1 of ESP32 Basis");
   Serial.println("Original V2.0: T. Voss, Extended V3.0: C. Ulbrich");
 
   Serial.println();
@@ -688,24 +722,29 @@ void setup() {
   Serial.println(F("Initializing DFPlayer ... (May take 3~5 seconds)"));
 
   myDFPlayer.begin(mySoftwareSerial, false, true);
-  
-    if (!myDFPlayer.begin(mySoftwareSerial)) {  //Use softwareSerial to communicate with mp3.
+  switchOnLeds(5, OK_COLOR );
 
-     Serial.println(myDFPlayer.readType(),HEX);
-     Serial.println(F("Unable to begin:"));
-     Serial.println(F("1.Please recheck the connection!"));
-     Serial.println(F("2.Please insert the SD card!"));
-     while(true);
-    }
-    Serial.println(F("DFPlayer Mini online."));
+  if (!myDFPlayer.begin(mySoftwareSerial)) {  //Use softwareSerial to communicate with mp3.
 
-  myDFPlayer.setTimeOut(500); //Set serial communictaion time out 500ms
+    Serial.println(myDFPlayer.readType(), HEX);
+    Serial.println(F("Unable to begin:"));
+    Serial.println(F("1.Please recheck the connection!"));
+    Serial.println(F("2.Please insert the SD card!"));
+    switchOnLeds(6, KO_COLOR );
+    while (true);
+  }
+  Serial.println(F("DFPlayer Mini online."));
+  switchOnLeds(6, OK_COLOR );
+
+  myDFPlayer.setTimeOut(500); //Set serial communication time out 500ms
   delay(100);
+  switchOnLeds(7, OK_COLOR );
   //----Set volume----
-  myDFPlayer.volume(15);  //Set volume value (0~30).
+  myDFPlayer.volume(init_Volume);  //Set init volume
   //myDFPlayer.volumeUp(); //Volume Up
   //myDFPlayer.volumeDown(); //Volume Down
   delay(100);
+  switchOnLeds(8, OK_COLOR );
   //----Set different EQ----
   myDFPlayer.EQ(DFPLAYER_EQ_NORMAL);
   //  myDFPlayer.EQ(DFPLAYER_EQ_POP);
@@ -714,6 +753,7 @@ void setup() {
   //  myDFPlayer.EQ(DFPLAYER_EQ_CLASSIC);
   //  myDFPlayer.EQ(DFPLAYER_EQ_BASS);
   delay(100);
+  switchOnLeds(9, OK_COLOR );
   //----Set device we use SD as default----
   //  myDFPlayer.outputDevice(DFPLAYER_DEVICE_U_DISK);
   myDFPlayer.outputDevice(DFPLAYER_DEVICE_SD);
@@ -730,23 +770,40 @@ void setup() {
 
   //----Read imformation----
   Serial.println("");
-  Serial.println(F("readState--------------------"));
+  Serial.println(F("----------------------------------------"));
+  Serial.print(F("| readState             : "));
   Serial.println(myDFPlayer.readState()); //read mp3 state
-  Serial.println(F("readVolume--------------------"));
+  switchOnLeds(10, OK_COLOR );
+  Serial.print(F("| readVolume            : "));
   Serial.println(myDFPlayer.readVolume()); //read current volume
-  //Serial.println(F("readEQ--------------------"));
-  //Serial.println(myDFPlayer.readEQ()); //read EQ setting
-  Serial.println(F("readFileCounts--------------------"));
+  switchOnLeds(11, OK_COLOR );
+  Serial.print(F("| readEQ                : "));
+  Serial.println(myDFPlayer.readEQ()); //read EQ setting
+  switchOnLeds(12, OK_COLOR );
+  Serial.print(F("| readFileCounts        : "));
   Serial.println(myDFPlayer.readFileCounts()); //read all file counts in SD card
-  Serial.println(F("readCurrentFileNumber--------------------"));
+  switchOnLeds(13, OK_COLOR );
+  Serial.print(F("| readCurrentFileNumber : "));
   Serial.println(myDFPlayer.readCurrentFileNumber()); //read current play file number
-  Serial.println(F("readFileCountsInFolder--------------------"));
-  Serial.println(myDFPlayer.readFileCountsInFolder(2)); //read fill counts in folder SD:/03
-  Serial.println(F("--------------------"));
-  delay(2000);
+  switchOnLeds(14, OK_COLOR );
+  Serial.print(F("| readFolderCounts      : "));//read folder counts inSD card
+  Serial.println(myDFPlayer.readFolderCounts()); //read
+  for (int f = 1; f <= myDFPlayer.readFolderCounts(); f ++) {
+    Serial.print(F("|    Folder n°"));
+    Serial.print(f); //read file counts in each folder in SD card
+    Serial.print(F(" : "));
+    Serial.println(myDFPlayer.readFileCountsInFolder(f)); //read file counts in each folder in SD card
+  }
 
-  //Play welcome reduced the time of wifi connect
-  myDFPlayer.playMp3Folder(900);
+  switchOnLeds(15, OK_COLOR );
+  Serial.println(F("----------------------------------------"));
+  delay(1000);
+  switchOnLeds(17, OK_COLOR );
+  delay(1000);
+  switchOnLeds(18, OK_COLOR );
+
+  //Play welcome, who reduced the time of wifi connect
+  playMp3Folder(903);
 
   preferences.begin("my-wifi", false);
   if (debug)WiFi.mode(WIFI_AP_STA);
@@ -754,6 +811,7 @@ void setup() {
   String strSSID = preferences.getString("SSID", "");
   String strPassword = preferences.getString("Password", "");
   String strHostname = preferences.getString("Hostname", String("TonUINO-" + String((uint32_t)chipid)));
+  switchOnLeds(19, OK_COLOR );
 
   // convert it to char*
   char* txtSSID = const_cast<char*>(strSSID.c_str());
@@ -767,21 +825,21 @@ void setup() {
   Serial.print(txtPassword);
   Serial.print(" with the following Hostname:  ");
   Serial.println(txtHostname);
+  switchOnLeds(20, OK_COLOR );
 
   // try to connect to the LAN
   success = WiFi_RouterNetworkConnect(txtSSID, txtPassword, txtHostname);
   if (success == 1) {
-    fill_solid(leds, NUM_LEDS, CRGB::Blue); // Change color of all LEDs
-    FastLED.show();
+    switchOnLeds(21, OK_COLOR );
   } else {
-    fill_solid(leds, NUM_LEDS, CRGB::Red); // Change color of all LEDs
-    FastLED.show();
+    switchOnLeds(21, KO_COLOR );
   }
 
   // Start access point"
   if (success == -1) {
     WiFi_AccessPointStart("ESP32_TonUINO");
   }
+  switchOnLeds(22, OK_COLOR );
 
   Serial.println ( "HTTP server started" );
 
@@ -789,6 +847,7 @@ void setup() {
   if (success == 1)timeClient.begin();
   if (success == 1)timeClient.setTimeOffset(+3600); //+1h Offset
   if (success == 1)timeClient.update();
+  switchOnLeds(23, OK_COLOR );
 
   // References for receiving HTML client information
   server.on ( "/", handleRoot );
@@ -804,6 +863,8 @@ void setup() {
   server.on ("/eq_classic", handleEQ_CLASSIC);
   server.on ("/eq_jazz", handleEQ_JAZZ);
   server.on ("/eq_norm", handleEQ_NORM);
+  server.on ("/reset_card", handleResetCard);
+  server.on ("/reset_eeprom", handleResetEEPROM);
   server.on ("/setup", handleSetup);
   server.on ("/update", handleUpdate);
 
@@ -838,6 +899,7 @@ void setup() {
   Serial.println ( "===============////////////// ================" );
   Serial.println ( "===============/ END SETUP  / ================" );
   Serial.println ( "===============/ //////////// ================" );
+  switchOnLeds(NUM_LEDS, OK_COLOR );
 }
 //==============END SETUP================================
 
@@ -883,9 +945,13 @@ void loop() {
       headphoneIn = 1;
       last_max_Volume = max_Volume; // Remember the last maximum volume
       last_Volume = myDFPlayer.readVolume();
-      max_Volume = 10;
+      max_Volume = max_Volume_headphone;
       if (myDFPlayer.readVolume() >= max_Volume) {
-        myDFPlayer.volume(10);
+        Serial.print("myDFPlayer.readVolume : ");
+        Serial.print(myDFPlayer.readVolume());
+        Serial.print(" >= max_Volume : ");
+        Serial.println(max_Volume);
+        myDFPlayer.volume(max_Volume_headphone);
       }
 
     } else if ((digitalRead(headphonePin) == 0) && (headphoneIn == 1)) {
@@ -899,8 +965,7 @@ void loop() {
       if (ignorePauseButton == false) {
         if (isPlaying()) {
           myDFPlayer.pause();
-          fill_solid(leds, NUM_LEDS, CRGB::Black); // Change color of all LEDs
-          FastLED.show();
+          switchOnLeds(NUM_LEDS, CRGB::Black );
           startSR = false;
           heatIndex = 0;
         } else {
@@ -917,8 +982,7 @@ void loop() {
       }
       else {
         knownCard = false;
-        myDFPlayer.playMp3Folder(800);
-        Serial.println(F("Reset card..."));
+        playMp3Folder(800);
         resetCard();
         mfrc522.PICC_HaltA();
         mfrc522.PCD_StopCrypto1();
@@ -970,50 +1034,47 @@ void loop() {
 
       knownCard = true;
       numTracksInFolder = myDFPlayer.readFileCountsInFolder(myCard.folder);
+      
+      Serial.println(F("----------------------------------------"));
+      Serial.print(F("| myCard.folder     : "));
+      Serial.println(myCard.folder);
+      Serial.print(F("| numTracksInFolder : "));
+      Serial.println(numTracksInFolder);
+      Serial.print(F("| myCard.mode       : "));
+      Serial.println(myCard.mode);
+      Serial.print(F("| myCard.color      : "));
+      Serial.println(myCard.color);
+      Serial.println(F("----------------------------------------"));
 
       // Radio play mode: a random file from the folder
       if (myCard.mode == 1) {
         Serial.println(F("Radio play mode -> play random track"));
         track = random(1, numTracksInFolder + 1);
         Serial.println(track);
-        myDFPlayer.playFolder(myCard.folder, track);
-        fill_solid(leds, NUM_LEDS, myCard.color); // Change color of all LEDs
-        FastLED.show();
       }
       // Album mode: play complete folder
       if (myCard.mode == 2) {
         Serial.println(F("Album mode -> play complete folder"));
         track = 1;
-        myDFPlayer.playFolder(myCard.folder, track);
-        fill_solid(leds, NUM_LEDS, myCard.color); // Change color of all LEDs
-        FastLED.show();
       }
       // Party Mode: Folder in random order
       if (myCard.mode == 3) {
-        Serial.println(
-          F("Party Mode -> play folders in random order"));
+        Serial.println(F("Party Mode -> play folders in random order"));
         track = random(1, numTracksInFolder + 1);
-        myDFPlayer.playFolder(myCard.folder, track);
-        fill_solid(leds, NUM_LEDS, myCard.color); // Change color of all LEDs
       }
       // Single mode: play a file from the folder
       if (myCard.mode == 4) {
-        Serial.println(
-          F("Single mode -> play a file from the folder"));
+        Serial.println(F("Single mode -> play a file from the folder"));
         track = myCard.special;
-        myDFPlayer.playFolder(myCard.folder, track);
-        fill_solid(leds, NUM_LEDS, myCard.color); // Change color of all LEDs
-        FastLED.show();
       }
       // Audiobook mode: play complete folder and remember progress
       if (myCard.mode == 5) {
         Serial.println(F("Audiobook mode -> play complete folder and remember progress"));
         track = EEPROM.read(myCard.folder);
         if (track == 0)track = 1;
-        myDFPlayer.playFolder(myCard.folder, track);
-        fill_solid(leds, NUM_LEDS, myCard.color); // Change color of all LEDs
-        FastLED.show();
       }
+      playFolder(myCard.folder, track);
+      switchOnLeds(NUM_LEDS, myCard.color );
     }
 
     // New card configured
@@ -1029,7 +1090,7 @@ void loop() {
 
 
 //==========================================================================================
-// Function voiceMenu 
+// Function voiceMenu
 int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
               bool preview , int previewFromFolder) {
   int returnValue = 0;
@@ -1038,8 +1099,8 @@ int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
   Serial.println(startMessage);
 
   if (startMessage != 0) {
-    myDFPlayer.playMp3Folder(startMessage);
-    myDFPlayer.playMp3Folder(startMessage);
+    playMp3Folder(startMessage);
+    playMp3Folder(startMessage);
   }
   do {
     pauseButton.read();
@@ -1054,31 +1115,31 @@ int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
 
     if (upButton.pressedFor(LONG_PRESS)) {
       returnValue = fmin(returnValue + 10, numberOfOptions);
-      myDFPlayer.playMp3Folder(messageOffset + returnValue);
+      playMp3Folder(messageOffset + returnValue);
       delay(1000);
       if (preview) {
         do {
           delay(10);
         } while (isPlaying());
         if (previewFromFolder == 0)
-          myDFPlayer.playFolder(returnValue, 1);
+          playFolder(returnValue, 1);
         else
-          myDFPlayer.playFolder(previewFromFolder, returnValue);
+          playFolder(previewFromFolder, returnValue);
       }
       ignoreUpButton = true;
     } else if (upButton.wasReleased()) {
       if (!ignoreUpButton) {
         returnValue = fmin(returnValue + 1, numberOfOptions);
-        myDFPlayer.playMp3Folder(messageOffset + returnValue);
+        playMp3Folder(messageOffset + returnValue);
         delay(1000);
         if (preview) {
           do {
             delay(10);
           } while (isPlaying());
           if (previewFromFolder == 0)
-            myDFPlayer.playFolder(returnValue, 1);
+            playFolder(returnValue, 1);
           else
-            myDFPlayer.playFolder(previewFromFolder, returnValue);
+            playFolder(previewFromFolder, returnValue);
         }
       } else
         ignoreUpButton = false;
@@ -1086,31 +1147,31 @@ int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
 
     if (downButton.pressedFor(LONG_PRESS)) {
       returnValue = fmax(returnValue - 10, 1);
-      myDFPlayer.playMp3Folder(messageOffset + returnValue);
+      playMp3Folder(messageOffset + returnValue);
       delay(1000);
       if (preview) {
         do {
           delay(10);
         } while (isPlaying());
         if (previewFromFolder == 0)
-          myDFPlayer.playFolder(returnValue, 1);
+          playFolder(returnValue, 1);
         else
-          myDFPlayer.playFolder(previewFromFolder, returnValue);
+          playFolder(previewFromFolder, returnValue);
       }
       ignoreDownButton = true;
     } else if (downButton.wasReleased()) {
       if (!ignoreDownButton) {
         returnValue = fmax(returnValue - 1, 1);
-        myDFPlayer.playMp3Folder(messageOffset + returnValue);
+        playMp3Folder(messageOffset + returnValue);
         delay(1000);
         if (preview) {
           do {
             delay(10);
           } while (isPlaying());
           if (previewFromFolder == 0)
-            myDFPlayer.playFolder(returnValue, 1);
+            playFolder(returnValue, 1);
           else
-            myDFPlayer.playFolder(previewFromFolder, returnValue);
+            playFolder(previewFromFolder, returnValue);
         }
       } else
         ignoreDownButton = false;
@@ -1121,22 +1182,27 @@ int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
 //==========================================================================================
 // Function resetCard
 void resetCard() {
+  Serial.println(F("Reset card..."));
   do {
     pauseButton.read();
     upButton.read();
     downButton.read();
 
     if (upButton.wasReleased() || downButton.wasReleased()) {
-      Serial.print(F("Canceled!"));
-      myDFPlayer.playMp3Folder(802);
+      Serial.println(F("Canceled!"));
+      switchOnLeds(NUM_LEDS, KO_COLOR );
+      playMp3Folder(802);
       return;
     }
   } while (!mfrc522.PICC_IsNewCardPresent());
 
   if (!mfrc522.PICC_ReadCardSerial())
+    Serial.println(F("No Card Detected!"));
+      switchOnLeds(NUM_LEDS, KO_COLOR );
     return;
 
-  Serial.print(F("Card is reconfigured!"));
+  Serial.println(F("Card is reconfigured!"));
+  switchOnLeds(NUM_LEDS, OK_COLOR );
   setupCard();
 }
 
@@ -1156,26 +1222,26 @@ void setupCard() {
   // Interrogate color
   myCard.color = voiceMenu(7, 600, 600);
   switch (myCard.color) {
-    case 4:
-      myCard.color = CRGB::LawnGreen;
+    case 1:
+      myCard.color = CRGB::Black;
+      break;
+    case 2:
+      myCard.color = CRGB::OrangeRed;
       break;
     case 3:
       myCard.color = CRGB::Yellow;
+      break;
+    case 4:
+      myCard.color = CRGB::LawnGreen;
+      break;
+    case 5:
+      myCard.color = CRGB::LightSkyBlue;
       break;
     case 6:
       myCard.color = CRGB::White;
       break;
     case 7:
       myCard.color = CRGB::Plum;
-      break;
-    case 2:
-      myCard.color = CRGB::OrangeRed;
-      break;
-    case 5:
-      myCard.color = CRGB::LightSkyBlue;
-      break;
-    case 1:
-      myCard.color = CRGB::Black;
       break;
   }
 
@@ -1219,6 +1285,7 @@ bool readCard(nfcTagObject *nfcTag) {
     returnValue = false;
     Serial.print(F("PCD_Authenticate() failed: "));
     Serial.println(mfrc522.GetStatusCodeName(status));
+    switchOnLeds(NUM_LEDS, KO_COLOR );
     return returnValue;
   }
 
@@ -1236,6 +1303,7 @@ bool readCard(nfcTagObject *nfcTag) {
     returnValue = false;
     Serial.print(F("MIFARE_Read() failed: "));
     Serial.println(mfrc522.GetStatusCodeName(status));
+    switchOnLeds(NUM_LEDS, KO_COLOR );
   }
   Serial.print(F("Data in block "));
   Serial.print(blockAddr);
@@ -1302,7 +1370,8 @@ void writeCard(nfcTagObject nfcTag) {
   if (status != MFRC522::STATUS_OK) {
     Serial.print(F("PCD_Authenticate() failed: "));
     Serial.println(mfrc522.GetStatusCodeName(status));
-    myDFPlayer.playMp3Folder(401);
+    switchOnLeds(NUM_LEDS, KO_COLOR );
+    playMp3Folder(401);
     return;
   }
 
@@ -1316,10 +1385,13 @@ void writeCard(nfcTagObject nfcTag) {
   if (status != MFRC522::STATUS_OK) {
     Serial.print(F("MIFARE_Write() failed: "));
     Serial.println(mfrc522.GetStatusCodeName(status));
-    myDFPlayer.playMp3Folder(401);
+    switchOnLeds(NUM_LEDS, KO_COLOR );
+    playMp3Folder(401);
   }
-  else
-    myDFPlayer.playMp3Folder(400);
+  else {
+    switchOnLeds(NUM_LEDS, CRGB::Green );
+    playMp3Folder(400);
+  }
   Serial.println();
   delay(100);
 }
@@ -1334,6 +1406,45 @@ void dump_byte_array(byte *buffer, byte bufferSize) {
     Serial.print(buffer[i] < 0x10 ? " 0" : " ");
     Serial.print(buffer[i], HEX);
   }
+}
+
+//==========================================================================================
+// Function ResetEEPROM
+void ResetEEPROM() {
+  Serial.print(F("EEPROM.length : "));
+  Serial.println(EEPROM_SIZE);
+  for (int i = 0; i < EEPROM_SIZE; i++) {
+    EEPROM.write(i, 0);
+  }
+  Serial.println(F("Reset -> EEPROM is deleted"));
+  switchOnLeds(NUM_LEDS, WARNING_COLOR );
+}
+
+//==========================================================================================
+// Function playMp3Folder
+void playMp3Folder(int track) {
+  Serial.print(F("playMp3Folder Track="));
+  Serial.println(track);
+  myDFPlayer.playMp3Folder(track);
+}
+
+//==========================================================================================
+// Function playFolder
+void playFolder(uint8_t folder, uint16_t track) {
+  Serial.print(F("playFolder Folder="));
+  Serial.print(folder);
+  Serial.print(F(" Track="));
+  Serial.println(track);
+  myDFPlayer.playLargeFolder(folder, track);
+}
+
+//==========================================================================================
+// Function switchOnLeds
+//  numToFill : number of leds to switch on
+//  color     : color of leds to switch on
+void switchOnLeds(int numToFill, uint32_t color) {
+  fill_solid(leds, numToFill, color);
+  FastLED.show();
 }
 
 //==========================================================================================
@@ -1353,21 +1464,29 @@ void stoppTimer() {
 //==========================================================================================
 // Function printDetail : Print the detail message from DFPlayer
 void printDetail(uint8_t type, int value) {
+  Serial.print(F("printDetail type="));
+  Serial.print(type);
+  Serial.print(F(" value="));
+  Serial.println(value);
+  switchOnLeds(NUM_LEDS, CRGB::Black );
   switch (type) {
     case TimeOut:
       Serial.println(F("Time Out!"));
+      switchOnLeds(NUM_LEDS, KO_COLOR );
       break;
     case WrongStack:
       Serial.println(F("Stack Wrong!"));
+      switchOnLeds(6, KO_COLOR );
       break;
     case DFPlayerCardInserted:
       Serial.println(F("Card Inserted!"));
-      break;
+      switchOnLeds(6, WARNING_COLOR );
     case DFPlayerCardRemoved:
       Serial.println(F("Card Removed!"));
-      break;
+      switchOnLeds(6, KO_COLOR );
     case DFPlayerCardOnline:
       Serial.println(F("Card Online!"));
+      switchOnLeds(6, OK_COLOR );
       break;
     case DFPlayerPlayFinished:
       Serial.print(F("Number:"));
@@ -1402,9 +1521,9 @@ void printDetail(uint8_t type, int value) {
         default:
           break;
       }
+      switchOnLeds(NUM_LEDS, KO_COLOR );
       break;
     default:
       break;
   }
 }
-
